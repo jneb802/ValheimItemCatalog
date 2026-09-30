@@ -65,6 +65,9 @@ the mod with the shared DLLs from deployed Praetoris Season 8 release 8.0.30
 in English. Twelve unresolved translations were marked; no exporter error occurred.
 The refund service successfully used this export in live OpenRouter/Jev requests.
 
-Dedicated-server startup remains untested because Valdev was leased by another
-test. Server-only mod and configuration effects still require a server export check.
+A later dedicated-server test on Valdev exported 1,998 items in English, with
+`dedicated_server: true` and all 45 loaded plugin versions. This used the deployed
+Season 8 release 8.0.30 files, the PraetorisClient PR #117 build, and this exporter.
+Twelve unresolved translations were marked. Live OpenRouter/Jev requests used
+this server export to resolve both vanilla items and a quality-2 Antler Bow.
 This mod does not alter Server Chest delivery behavior.
