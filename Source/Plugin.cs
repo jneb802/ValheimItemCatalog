@@ -1,80 +1,119 @@
 using System;
+using System.Collections;
+using System.Collections.Generic;
 using System.IO;
-using System.Reflection;
+using System.Linq;
+using System.Runtime.Serialization;
+using System.Runtime.Serialization.Json;
 using BepInEx;
+using BepInEx.Bootstrap;
 using BepInEx.Configuration;
-using BepInEx.Logging;
-using HarmonyLib;
+using UnityEngine;
 
-namespace Template
+namespace ValheimItemCatalog
 {
-    [BepInPlugin(ModGUID, ModName, ModVersion)]
-    public class TemplatePlugin : BaseUnityPlugin
+    [BepInPlugin("warpalicious.ValheimItemCatalog", "Valheim Item Catalog", "1.0.0")]
+    public sealed class Plugin : BaseUnityPlugin
     {
-        private const string ModName = "Template";
-        private const string ModVersion = "1.0.0";
-        private const string Author = "modAuthorName";
-        private const string ModGUID = Author + "." + ModName;
-        private static string ConfigFileName = ModGUID + ".cfg";
-        private static string ConfigFileFullPath = BepInEx.Paths.ConfigPath + Path.DirectorySeparatorChar + ConfigFileName;
+        private ConfigEntry<string> outputPath = null!;
+        private ConfigEntry<bool> exportOnClients = null!;
 
-        private readonly Harmony HarmonyInstance = new(ModGUID);
-
-        public static readonly ManualLogSource TemplateLogger = BepInEx.Logging.Logger.CreateLogSource(ModName);
-
-        public void Awake()
+        private void Awake()
         {
-            Assembly assembly = Assembly.GetExecutingAssembly();
-            HarmonyInstance.PatchAll(assembly);
-            SetupWatcher();
+            outputPath = Config.Bind("Export", "OutputPath", "item-catalog.json", "Absolute path or path relative to BepInEx. Replaced after a complete export.");
+            exportOnClients = Config.Bind("Export", "ExportOnClients", false, "Enable only for local catalogue validation. Servers export automatically.");
+            StartCoroutine(ExportWhenReady());
         }
 
-        private void OnDestroy()
+        private IEnumerator ExportWhenReady()
         {
-            Config.Save();
+            while (ZNet.instance == null || ZNetScene.instance == null || ObjectDB.instance == null || Game.instance == null)
+                yield return new WaitForSeconds(1);
+            if (!ZNet.instance.IsDedicated() && !exportOnClients.Value) yield break;
+            int previousCount = -1;
+            int stableChecks = 0;
+            while (stableChecks < 5)
+            {
+                yield return new WaitForSeconds(1);
+                int count = ObjectDB.instance.m_items.Count;
+                stableChecks = count > 0 && count == previousCount ? stableChecks + 1 : 0;
+                previousCount = count;
+            }
+            try { Export(); }
+            catch (Exception exception) { Logger.LogError("Item catalogue export failed: " + exception); }
         }
-        
-        private void SetupWatcher()
+
+        private void Export()
         {
-            _lastReloadTime = DateTime.Now;
-            FileSystemWatcher watcher = new(BepInEx.Paths.ConfigPath, ConfigFileName);
-            // Due to limitations of technology this can trigger twice in a row
-            watcher.Changed += ReadConfigValues;
-            watcher.Created += ReadConfigValues;
-            watcher.Renamed += ReadConfigValues;
-            watcher.IncludeSubdirectories = true;
-            watcher.EnableRaisingEvents = true;
-        }
-
-        private DateTime _lastReloadTime;
-        private const long RELOAD_DELAY = 10000000; // One second
-
-        private void ReadConfigValues(object sender, FileSystemEventArgs e)
-        {
-            var now = DateTime.Now;
-            var time = now.Ticks - _lastReloadTime.Ticks;
-            if (!File.Exists(ConfigFileFullPath) || time < RELOAD_DELAY) return;
-
+            Catalog catalog = new Catalog
+            {
+                exported_at = DateTime.UtcNow.ToString("o"),
+                game_version = Version.GetVersionString(),
+                language = Localization.instance.GetSelectedLanguage(),
+                dedicated_server = ZNet.instance.IsDedicated(),
+                mods = Chainloader.PluginInfos.Values.Select(info => new Mod
+                {
+                    guid = info.Metadata.GUID, name = info.Metadata.Name, version = info.Metadata.Version.ToString()
+                }).OrderBy(mod => mod.guid, StringComparer.Ordinal).ToList()
+            };
+            // Use the same ObjectDB lookup that validates Server Chest deliveries.
+            foreach (GameObject prefab in ObjectDB.instance.m_items.OrderBy(item => item.name, StringComparer.Ordinal))
+            {
+                ItemDrop drop = prefab.GetComponent<ItemDrop>();
+                if (drop == null || ObjectDB.instance.GetItemPrefab(prefab.name) != prefab) continue;
+                ItemDrop.ItemData.SharedData data = drop.m_itemData.m_shared;
+                string displayName = Localization.instance.Localize(data.m_name);
+                catalog.items.Add(new Item
+                {
+                    prefab = prefab.name, display_name = displayName, localization_key = data.m_name,
+                    max_stack_size = data.m_maxStackSize, max_quality = data.m_maxQuality,
+                    item_type = data.m_itemType.ToString(),
+                    localization_resolved = !displayName.Contains("[" + data.m_name.TrimStart('$') + "]") && !displayName.StartsWith("$")
+                });
+            }
+            if (catalog.items.Count == 0) throw new InvalidOperationException("No items were registered.");
+            string path = Path.IsPathRooted(outputPath.Value) ? outputPath.Value : Path.Combine(Paths.BepInExRootPath, outputPath.Value);
+            Directory.CreateDirectory(Path.GetDirectoryName(Path.GetFullPath(path))!);
+            string temporary = path + ".tmp";
             try
             {
-                TemplateLogger.LogInfo("Attempting to reload configuration...");
-                Config.Reload();
-                TemplateLogger.LogInfo("Configuration reloaded successfully!");
+                using (FileStream stream = File.Create(temporary))
+                    new DataContractJsonSerializer(typeof(Catalog)).WriteObject(stream, catalog);
+                if (File.Exists(path)) File.Replace(temporary, path, null);
+                else File.Move(temporary, path);
             }
-            catch
-            {
-                TemplateLogger.LogError($"There was an issue loading {ConfigFileName}");
-                return;
-            }
-
-            _lastReloadTime = now;
-
-            // Update any runtime configurations here
-            if (ZNet.instance != null && !ZNet.instance.IsDedicated())
-            {
-                TemplateLogger.LogInfo("Updating runtime configurations...");
-                // Add your configuration update logic here
-            }
+            finally { if (File.Exists(temporary)) File.Delete(temporary); }
+            Logger.LogInfo("Exported " + catalog.items.Count + " items in " + catalog.language + " to " + path + "; unresolved names=" + catalog.items.Count(item => !item.localization_resolved));
         }
     }
-} 
+
+    [DataContract]
+    public sealed class Catalog
+    {
+        [DataMember] public int schema_version = 1;
+        [DataMember] public string exported_at = "";
+        [DataMember] public string game_version = "";
+        [DataMember] public string language = "";
+        [DataMember] public bool dedicated_server;
+        [DataMember] public List<Mod> mods = new List<Mod>();
+        [DataMember] public List<Item> items = new List<Item>();
+    }
+    [DataContract]
+    public sealed class Mod
+    {
+        [DataMember] public string guid = "";
+        [DataMember] public string name = "";
+        [DataMember] public string version = "";
+    }
+    [DataContract]
+    public sealed class Item
+    {
+        [DataMember] public string prefab = "";
+        [DataMember] public string display_name = "";
+        [DataMember] public string localization_key = "";
+        [DataMember] public int max_stack_size;
+        [DataMember] public int max_quality;
+        [DataMember] public string item_type = "";
+        [DataMember] public bool localization_resolved;
+    }
+}
